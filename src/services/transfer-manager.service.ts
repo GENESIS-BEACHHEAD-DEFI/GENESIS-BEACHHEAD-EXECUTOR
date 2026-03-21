@@ -9,6 +9,7 @@
  * Guards:
  * - Max 1 in-flight transfer per exchange (protects $40 balance)
  * - No double-buy on same token if transfer already in-flight
+ * - Dynamic profitability gate: spread must cover network fee + trading fees for THIS clip size
  */
 
 import type { BeachheadRequest, TransferState } from "../types";
@@ -26,7 +27,7 @@ export class TransferManagerService {
 
   constructor(
     private client: BeachheadClientService,
-    private networkSelector: NetworkSelectorService,
+    private netSelector: NetworkSelectorService,
     private positions: PositionService,
   ) {}
 
@@ -53,7 +54,6 @@ export class TransferManagerService {
     const buyEx = request.buyExchange.toLowerCase();
     const sellEx = request.sellExchange.toLowerCase();
 
-    // Check both exchanges are configured
     if (!this.client.isExchangeConfigured(buyEx)) {
       return { ok: false, reason: `${request.buyExchange} not configured` };
     }
@@ -81,13 +81,11 @@ export class TransferManagerService {
 
   /**
    * Execute the full buy→transfer→sell pipeline.
-   * Returns immediately after BUY — transfer+sell happens async.
    */
   async execute(request: BeachheadRequest): Promise<TransferState> {
     const token = this.client.extractBaseToken(request.pair);
     const quoteToken = this.client.extractQuoteToken(request.pair);
 
-    // Initialize transfer state
     const state: TransferState = {
       id: request.id,
       status: "BUYING",
@@ -128,15 +126,14 @@ export class TransferManagerService {
       return state;
     }
 
-    // ── Step 2: Find network + get deposit address ──
+    // ── Step 2: Find network + profitability check + get deposit address ──
     try {
       const buyInstance = this.client.getInstance(state.buyExchange);
       const sellInstance = this.client.getInstance(state.sellExchange);
       if (!buyInstance || !sellInstance) throw new Error("Exchange instance missing");
 
-      const network = await this.networkSelector.getPreferredNetwork(token, buyInstance, sellInstance);
-      if (!network) {
-        // No cheap network — tokens stuck on buy exchange but not lost
+      const netResult = await this.netSelector.getPreferredNetwork(token, buyInstance, sellInstance);
+      if (!netResult) {
         state.status = "FAILED";
         state.error = "NO_CHEAP_NETWORK: no shared TRC20/SOL/BEP20 network found";
         state.completedAt = Date.now();
@@ -145,11 +142,27 @@ export class TransferManagerService {
         return state;
       }
 
-      state.network = network;
+      // ── Dynamic profitability gate ──
+      // Now we know the EXACT network, calculate if this trade is still profitable
+      const minBps = this.netSelector.calculateMinSpreadBps(request.amount, netResult.network);
+      if (request.grossSpreadBps < minBps) {
+        state.status = "FAILED";
+        state.error = `UNPROFITABLE: ${request.grossSpreadBps.toFixed(0)}bps < ${minBps}bps min for ${netResult.network} @ $${request.amount} clip (fee=$${netResult.estimatedFeeUsd})`;
+        state.completedAt = Date.now();
+        console.log(
+          `[TRANSFER] UNPROFITABLE id=${request.id} ${token} — ` +
+          `spread=${request.grossSpreadBps.toFixed(0)}bps < min=${minBps}bps ` +
+          `(net=${netResult.network}, fee=$${netResult.estimatedFeeUsd}, clip=$${request.amount})`,
+        );
+        this.positions.record(state);
+        return state;
+      }
 
-      const deposit = await this.client.getDepositAddress(state.sellExchange, token, network);
+      state.network = netResult.network;
+
+      const deposit = await this.client.getDepositAddress(state.sellExchange, token, netResult.network);
       state.depositAddress = deposit.address;
-      console.log(`[TRANSFER] DEPOSIT_ADDR id=${request.id} ${state.sellExchange} → ${deposit.address} (${network})`);
+      console.log(`[TRANSFER] DEPOSIT_ADDR id=${request.id} ${state.sellExchange} → ${deposit.address} (${netResult.network})`);
 
       // ── Step 3: WITHDRAW ──
       state.status = "WITHDRAWING";
@@ -158,13 +171,13 @@ export class TransferManagerService {
         token,
         state.quantity,
         deposit.address,
-        network,
+        netResult.network,
         deposit.tag,
       );
       state.withdrawalId = withdrawal.withdrawalId;
       state.withdrawalFee = withdrawal.fee;
       state.status = "TRANSFERRING";
-      console.log(`[TRANSFER] TRANSFERRING id=${request.id} ${state.quantity} ${token} via ${network}`);
+      console.log(`[TRANSFER] TRANSFERRING id=${request.id} ${state.quantity} ${token} via ${netResult.network}`);
 
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown";
@@ -187,7 +200,6 @@ export class TransferManagerService {
     for (const [id, state] of this.transfers) {
       if (state.status !== "TRANSFERRING") continue;
 
-      // Check for timeout → STALLED
       if (Date.now() - state.startedAt > TRANSFER_TIMEOUT_MS) {
         state.status = "STALLED";
         state.error = `TIMEOUT: ${TRANSFER_TIMEOUT_MS}ms elapsed — manual review needed`;
@@ -197,7 +209,6 @@ export class TransferManagerService {
         continue;
       }
 
-      // Check if deposit arrived
       try {
         const depositCheck = await this.client.checkDeposit(
           state.sellExchange,
@@ -208,7 +219,6 @@ export class TransferManagerService {
 
         if (!depositCheck.arrived) continue;
 
-        // ── ARRIVED → SELL ──
         state.status = "ARRIVED";
         const sellQuantity = depositCheck.actualAmount ?? (state.quantity - (state.withdrawalFee || 0));
         console.log(`[TRANSFER] ARRIVED id=${id} ${sellQuantity} ${state.token} on ${state.sellExchange}`);
@@ -223,7 +233,6 @@ export class TransferManagerService {
           state.sellOrderId = sellResult.orderId;
           state.sellFillPrice = sellResult.avgPrice;
 
-          // Calculate P&L: sell proceeds - buy cost - fees
           const buyTotal = state.costUsdt;
           const sellTotal = sellResult.totalReceived;
           state.realizedPnl = Math.round((sellTotal - buyTotal) * 100) / 100;
@@ -247,23 +256,16 @@ export class TransferManagerService {
           this.positions.record(state);
         }
       } catch (err) {
-        // Polling error — don't fail the transfer, just log and retry next poll
         const msg = err instanceof Error ? err.message : "Unknown";
         console.log(`[TRANSFER] POLL_ERROR id=${id} — ${msg}`);
       }
     }
   }
 
-  /**
-   * Get all transfer states for monitoring.
-   */
   getAllTransfers(): TransferState[] {
     return Array.from(this.transfers.values());
   }
 
-  /**
-   * Get in-flight transfers only.
-   */
   getInflightTransfers(): TransferState[] {
     return Array.from(this.transfers.values()).filter((t) => this.isInFlight(t));
   }

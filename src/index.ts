@@ -20,7 +20,6 @@ import type { BeachheadRequest } from "./types";
 const PORT = parseInt(process.env.PORT || "8411", 10);
 const KILL_SWITCH_URL = process.env.KILL_SWITCH_URL || "http://genesis-kill-switch-v2:7100";
 const GTC_URL = process.env.GTC_URL || "http://genesis-global-telemetry-cloud:8600";
-const BEACHHEAD_MIN_SPREAD_BPS = parseInt(process.env.BEACHHEAD_MIN_SPREAD_BPS || "500", 10);
 const BEACHHEAD_MAX_SPREAD_BPS = parseInt(process.env.BEACHHEAD_MAX_SPREAD_BPS || "5000", 10);
 
 const app = express();
@@ -47,8 +46,17 @@ app.get("/health", (_req, res) => {
     inflightCount: inflight.length,
     stats: positions.getStats(),
     config: {
-      minSpreadBps: BEACHHEAD_MIN_SPREAD_BPS,
+      spreadFilter: "DYNAMIC",
       maxSpreadBps: BEACHHEAD_MAX_SPREAD_BPS,
+      exampleMinBps: {
+        "£5_SOL": networkSelector.calculateMinSpreadBps(6.30, "SOL"),
+        "£5_TRC20": networkSelector.calculateMinSpreadBps(6.30, "TRC20"),
+        "£10_SOL": networkSelector.calculateMinSpreadBps(12.60, "SOL"),
+        "£10_TRC20": networkSelector.calculateMinSpreadBps(12.60, "TRC20"),
+        "£25_SOL": networkSelector.calculateMinSpreadBps(31.50, "SOL"),
+        "£25_TRC20": networkSelector.calculateMinSpreadBps(31.50, "TRC20"),
+      },
+      networkFees: networkSelector.getFeesTable(),
     },
   });
 });
@@ -110,11 +118,14 @@ app.post("/execute", async (req, res) => {
     return;
   }
 
-  // Spread filter (executor-side safety — ARB detector should also filter)
-  if (request.grossSpreadBps < BEACHHEAD_MIN_SPREAD_BPS) {
+  // Dynamic spread pre-filter — uses cheapest possible network fee (SOL = $0.01)
+  // This is permissive: lets through anything that COULD be profitable on any network.
+  // The transfer manager does a precise profitability check after network selection.
+  const preFilterMinBps = networkSelector.calculateMinSpreadBps(request.amount);
+  if (request.grossSpreadBps < preFilterMinBps) {
     res.status(200).json({
       accepted: false,
-      reason: `SPREAD_TOO_LOW: ${request.grossSpreadBps}bps < min ${BEACHHEAD_MIN_SPREAD_BPS}bps`,
+      reason: `SPREAD_TOO_LOW: ${request.grossSpreadBps}bps < dynamic min ${preFilterMinBps}bps (clip=$${request.amount}, cheapest network)`,
       id: request.id,
     });
     return;
@@ -219,6 +230,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`[BEACHHEAD] Genesis Beachhead Executor listening on port ${PORT}`);
   console.log(`[BEACHHEAD] Mode: ${client.getConfiguredExchanges().length > 0 ? "LIVE" : "DRY_RUN"}`);
   console.log(`[BEACHHEAD] Configured exchanges: ${client.getConfiguredExchanges().join(", ") || "NONE"}`);
-  console.log(`[BEACHHEAD] Spread filter: min=${BEACHHEAD_MIN_SPREAD_BPS}bps max=${BEACHHEAD_MAX_SPREAD_BPS}bps`);
+  console.log(`[BEACHHEAD] Spread filter: DYNAMIC (clip-size × network adaptive) max=${BEACHHEAD_MAX_SPREAD_BPS}bps`);
+  console.log(`[BEACHHEAD] Example min spreads: £5/SOL=${networkSelector.calculateMinSpreadBps(6.30, "SOL")}bps, £5/TRC20=${networkSelector.calculateMinSpreadBps(6.30, "TRC20")}bps, £25/SOL=${networkSelector.calculateMinSpreadBps(31.50, "SOL")}bps, £25/TRC20=${networkSelector.calculateMinSpreadBps(31.50, "TRC20")}bps`);
   console.log(`[BEACHHEAD] Kill Switch: ${KILL_SWITCH_URL}`);
 });
