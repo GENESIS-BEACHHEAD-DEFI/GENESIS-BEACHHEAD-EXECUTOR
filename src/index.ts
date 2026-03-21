@@ -11,6 +11,7 @@
  */
 
 import express from "express";
+import { createHash, randomUUID } from "crypto";
 import { BeachheadClientService } from "./services/beachhead-client.service";
 import { NetworkSelectorService } from "./services/network-selector.service";
 import { TransferManagerService } from "./services/transfer-manager.service";
@@ -19,8 +20,37 @@ import type { BeachheadRequest } from "./types";
 
 const PORT = parseInt(process.env.PORT || "8411", 10);
 const KILL_SWITCH_URL = process.env.KILL_SWITCH_URL || "http://genesis-kill-switch-v2:7100";
-const GTC_URL = process.env.GTC_URL || "http://genesis-global-telemetry-cloud:8600";
+const GTC_URL = process.env.GTC_URL || "http://genesis-beachhead-gtc:8650";
+const LEDGER_LITE_URL = process.env.LEDGER_LITE_URL || "http://genesis-ledger-lite:8500";
 const BEACHHEAD_MAX_SPREAD_BPS = parseInt(process.env.BEACHHEAD_MAX_SPREAD_BPS || "5000", 10);
+
+/**
+ * Post event to Ledger Lite for compliance recording.
+ * Every fork, decision, variable change → recorded. Accountable to the last 1p.
+ * payloadHash computed upstream (here) — Ledger Lite verifies, never generates.
+ */
+function postToLedgerLite(eventType: string, data: Record<string, unknown>): void {
+  const payload = {
+    id: randomUUID(),
+    rail: "BEACHHEAD" as const,
+    eventType,
+    source: "genesis-beachhead-executor",
+    timestamp: new Date().toISOString(),
+    data,
+  };
+
+  // Compute payloadHash = sha256(stable JSON of payload WITHOUT payloadHash)
+  const payloadHash = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+
+  fetch(`${LEDGER_LITE_URL}/payload`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...payload, payloadHash }),
+    signal: AbortSignal.timeout(5000),
+  }).catch((err) => {
+    console.log(`[BEACHHEAD] Ledger Lite POST failed: ${err instanceof Error ? err.message : "Unknown"}`);
+  });
+}
 
 const app = express();
 app.use(express.json());
@@ -123,20 +153,16 @@ app.post("/execute", async (req, res) => {
   // The transfer manager does a precise profitability check after network selection.
   const preFilterMinBps = networkSelector.calculateMinSpreadBps(request.amount);
   if (request.grossSpreadBps < preFilterMinBps) {
-    res.status(200).json({
-      accepted: false,
-      reason: `SPREAD_TOO_LOW: ${request.grossSpreadBps}bps < dynamic min ${preFilterMinBps}bps (clip=$${request.amount}, cheapest network)`,
-      id: request.id,
-    });
+    const reason = `SPREAD_TOO_LOW: ${request.grossSpreadBps}bps < dynamic min ${preFilterMinBps}bps (clip=$${request.amount}, cheapest network)`;
+    postToLedgerLite("SPREAD_REJECT", { id: request.id, pair: request.pair, buyExchange: request.buyExchange, sellExchange: request.sellExchange, grossSpreadBps: request.grossSpreadBps, minBps: preFilterMinBps, amount: request.amount, reason });
+    res.status(200).json({ accepted: false, reason, id: request.id });
     return;
   }
 
   if (request.grossSpreadBps > BEACHHEAD_MAX_SPREAD_BPS) {
-    res.status(200).json({
-      accepted: false,
-      reason: `SPREAD_TOO_HIGH: ${request.grossSpreadBps}bps > max ${BEACHHEAD_MAX_SPREAD_BPS}bps`,
-      id: request.id,
-    });
+    const reason = `SPREAD_TOO_HIGH: ${request.grossSpreadBps}bps > max ${BEACHHEAD_MAX_SPREAD_BPS}bps`;
+    postToLedgerLite("SPREAD_REJECT", { id: request.id, pair: request.pair, grossSpreadBps: request.grossSpreadBps, maxBps: BEACHHEAD_MAX_SPREAD_BPS, reason });
+    res.status(200).json({ accepted: false, reason, id: request.id });
     return;
   }
 
@@ -163,26 +189,23 @@ app.post("/execute", async (req, res) => {
   // Guard checks
   const guard = transferManager.canAccept(request);
   if (!guard.ok) {
-    res.status(200).json({
-      accepted: false,
-      reason: `GUARD: ${guard.reason}`,
-      id: request.id,
-    });
+    const reason = `GUARD: ${guard.reason}`;
+    postToLedgerLite("GUARD_REJECT", { id: request.id, pair: request.pair, buyExchange: request.buyExchange, sellExchange: request.sellExchange, grossSpreadBps: request.grossSpreadBps, amount: request.amount, reason });
+    res.status(200).json({ accepted: false, reason, id: request.id });
     return;
   }
 
   // Check USDT balance on buy exchange
   const usdtBalance = await client.getUsdtBalance(request.buyExchange);
   if (usdtBalance < request.amount) {
-    res.status(200).json({
-      accepted: false,
-      reason: `INSUFFICIENT_BALANCE: ${request.buyExchange} has $${usdtBalance.toFixed(2)} USDT, need $${request.amount.toFixed(2)}`,
-      id: request.id,
-    });
+    const reason = `INSUFFICIENT_BALANCE: ${request.buyExchange} has $${usdtBalance.toFixed(2)} USDT, need $${request.amount.toFixed(2)}`;
+    postToLedgerLite("BALANCE_REJECT", { id: request.id, pair: request.pair, buyExchange: request.buyExchange, usdtBalance, amountNeeded: request.amount, reason });
+    res.status(200).json({ accepted: false, reason, id: request.id });
     return;
   }
 
   // Accept and execute
+  postToLedgerLite("BEACHHEAD_ACCEPTED", { id: request.id, pair: request.pair, buyExchange: request.buyExchange, sellExchange: request.sellExchange, grossSpreadBps: request.grossSpreadBps, amount: request.amount, usdtBalance });
   res.status(202).json({
     accepted: true,
     id: request.id,
@@ -197,6 +220,25 @@ app.post("/execute", async (req, res) => {
   try {
     const result = await transferManager.execute(request);
 
+    const executionData = {
+      id: request.id,
+      pair: request.pair,
+      token: result.token,
+      buyExchange: request.buyExchange,
+      sellExchange: request.sellExchange,
+      status: result.status,
+      network: result.network,
+      amount: request.amount,
+      buyPrice: result.buyPrice,
+      sellPrice: result.sellPrice,
+      quantity: result.quantity,
+      grossSpreadBps: request.grossSpreadBps,
+      realizedPnl: result.realizedPnl,
+      withdrawalFee: result.withdrawalFee,
+      error: result.error,
+      durationMs: result.completedAt ? result.completedAt - result.startedAt : undefined,
+    };
+
     // GTC telemetry (fire-and-forget)
     fetch(`${GTC_URL}/telemetry/append`, {
       method: "POST",
@@ -206,22 +248,16 @@ app.post("/execute", async (req, res) => {
         eventType: "BEACHHEAD_EXECUTION",
         source: "genesis-beachhead-executor",
         timestamp: new Date().toISOString(),
-        payload: {
-          id: request.id,
-          pair: request.pair,
-          token: result.token,
-          buyExchange: request.buyExchange,
-          sellExchange: request.sellExchange,
-          status: result.status,
-          network: result.network,
-          realizedPnl: result.realizedPnl,
-          durationMs: result.completedAt ? result.completedAt - result.startedAt : undefined,
-        },
+        payload: executionData,
       }),
     }).catch(() => {});
+
+    // Ledger Lite compliance (fire-and-forget) — every execution recorded
+    postToLedgerLite("BEACHHEAD_EXECUTION", executionData);
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown";
     console.error(`[BEACHHEAD] Execution error — id=${request.id} error=${msg}`);
+    postToLedgerLite("BEACHHEAD_ERROR", { id: request.id, error: msg });
   }
 });
 
