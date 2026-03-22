@@ -16,6 +16,7 @@ import { BeachheadClientService } from "./services/beachhead-client.service";
 import { NetworkSelectorService } from "./services/network-selector.service";
 import { TransferManagerService } from "./services/transfer-manager.service";
 import { PositionService } from "./services/position.service";
+import { FirstStrikeService } from "./services/first-strike.service";
 import type { BeachheadRequest } from "./types";
 
 const PORT = parseInt(process.env.PORT || "8411", 10);
@@ -59,6 +60,7 @@ const client = new BeachheadClientService();
 const networkSelector = new NetworkSelectorService();
 const positions = new PositionService();
 const transferManager = new TransferManagerService(client, networkSelector, positions);
+const firstStrike = new FirstStrikeService(client, networkSelector);
 
 // Start polling for deposit arrivals
 transferManager.startPolling();
@@ -75,6 +77,7 @@ app.get("/health", (_req, res) => {
     configuredExchanges: client.getConfiguredExchanges(),
     inflightCount: inflight.length,
     stats: positions.getStats(),
+    firstStrike: firstStrike.getStats(),
     config: {
       spreadFilter: "DYNAMIC",
       maxSpreadBps: BEACHHEAD_MAX_SPREAD_BPS,
@@ -111,6 +114,17 @@ app.get("/state", (_req, res) => {
     recentPositions: positions.getRecentPositions(50),
     totalTransfers: allTransfers.length,
     configuredExchanges: client.getConfiguredExchanges(),
+  });
+});
+
+// ── GET /first-strike ── First Strike Protocol stats + recent simulations
+app.get("/first-strike", (req, res) => {
+  const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 50;
+  res.json({
+    protocol: "FIRST_STRIKE",
+    doctrine: "Prove the kill before pulling the trigger. Section 47 Phase 0.",
+    stats: firstStrike.getStats(),
+    recentSimulations: firstStrike.getRecentSimulations(limit),
   });
 });
 
@@ -204,8 +218,69 @@ app.post("/execute", async (req, res) => {
     return;
   }
 
+  // ════════════════════════════════════════════════════════════════
+  // FIRST STRIKE PROTOCOL — Section 47 Phase 0
+  // "Prove the kill before pulling the trigger."
+  // Fetches LIVE order books, simulates execution, proves profit.
+  // NO_GO = abort before a single penny is risked.
+  // ════════════════════════════════════════════════════════════════
+  const simulation = await firstStrike.simulate(request);
+
+  // GTC telemetry — every simulation feeds Brighton's intelligence
+  fetch(`${GTC_URL}/telemetry/append`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      eventId: `first-strike-${request.id}-${Date.now()}`,
+      eventType: "FIRST_STRIKE_SIMULATION",
+      source: "genesis-beachhead-executor",
+      timestamp: new Date().toISOString(),
+      payload: simulation,
+    }),
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => {});
+
+  if (simulation.verdict === "NO_GO") {
+    postToLedgerLite("FIRST_STRIKE_ABORT", {
+      id: request.id,
+      pair: request.pair,
+      buyExchange: request.buyExchange,
+      sellExchange: request.sellExchange,
+      reason: simulation.reason,
+      liveSpreadBps: simulation.liveSpreadBps,
+      expectedProfitUsd: simulation.expectedProfitUsd,
+      simulationDurationMs: simulation.simulationDurationMs,
+    });
+    res.status(200).json({
+      accepted: false,
+      reason: `FIRST_STRIKE_NO_GO: ${simulation.reason}`,
+      id: request.id,
+      simulation: {
+        liveSpreadBps: simulation.liveSpreadBps,
+        expectedProfitUsd: simulation.expectedProfitUsd,
+        totalCostsUsd: simulation.totalCostsUsd,
+        buySlippageBps: simulation.buySlippageBps,
+        sellSlippageBps: simulation.sellSlippageBps,
+        durationMs: simulation.simulationDurationMs,
+      },
+    });
+    return;
+  }
+
+  // ██ FIRST STRIKE GO — profit mathematically proven ██
+  postToLedgerLite("FIRST_STRIKE_GO", {
+    id: request.id,
+    pair: request.pair,
+    buyExchange: request.buyExchange,
+    sellExchange: request.sellExchange,
+    liveSpreadBps: simulation.liveSpreadBps,
+    expectedProfitUsd: simulation.expectedProfitUsd,
+    expectedProfitBps: simulation.expectedProfitBps,
+    simulationDurationMs: simulation.simulationDurationMs,
+  });
+
   // Accept and execute
-  postToLedgerLite("BEACHHEAD_ACCEPTED", { id: request.id, pair: request.pair, buyExchange: request.buyExchange, sellExchange: request.sellExchange, grossSpreadBps: request.grossSpreadBps, amount: request.amount, usdtBalance });
+  postToLedgerLite("BEACHHEAD_ACCEPTED", { id: request.id, pair: request.pair, buyExchange: request.buyExchange, sellExchange: request.sellExchange, grossSpreadBps: request.grossSpreadBps, amount: request.amount, usdtBalance, firstStrike: { verdict: "GO", expectedProfitUsd: simulation.expectedProfitUsd } });
   res.status(202).json({
     accepted: true,
     id: request.id,
@@ -269,4 +344,5 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`[BEACHHEAD] Spread filter: DYNAMIC (clip-size × network adaptive) max=${BEACHHEAD_MAX_SPREAD_BPS}bps`);
   console.log(`[BEACHHEAD] Example min spreads: £5/SOL=${networkSelector.calculateMinSpreadBps(6.30, "SOL")}bps, £5/TRC20=${networkSelector.calculateMinSpreadBps(6.30, "TRC20")}bps, £25/SOL=${networkSelector.calculateMinSpreadBps(31.50, "SOL")}bps, £25/TRC20=${networkSelector.calculateMinSpreadBps(31.50, "TRC20")}bps`);
   console.log(`[BEACHHEAD] Kill Switch: ${KILL_SWITCH_URL}`);
+  console.log(`[BEACHHEAD] First Strike Protocol: ARMED — "Prove the kill before pulling the trigger."`);
 });
