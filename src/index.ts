@@ -23,6 +23,7 @@ const PORT = parseInt(process.env.PORT || "8411", 10);
 const KILL_SWITCH_URL = process.env.KILL_SWITCH_URL || "http://genesis-kill-switch-v2:7100";
 const GTC_URL = process.env.GTC_URL || "http://genesis-beachhead-gtc:8650";
 const LEDGER_LITE_URL = process.env.LEDGER_LITE_URL || "http://genesis-ledger-lite:8500";
+const MIRROR_FEED_URL = process.env.MIRROR_FEED_URL || "http://genesis-mirror-feed:8850";
 const BEACHHEAD_MAX_SPREAD_BPS = parseInt(process.env.BEACHHEAD_MAX_SPREAD_BPS || "5000", 10);
 
 /**
@@ -329,6 +330,28 @@ app.post("/execute", async (req, res) => {
 
     // Ledger Lite compliance (fire-and-forget) — every execution recorded
     postToLedgerLite("BEACHHEAD_EXECUTION", executionData);
+
+    // Mirror Feed telemetry (fire-and-forget) — self-referential execution stream
+    fetch(`${MIRROR_FEED_URL}/telemetry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        executionId: request.id,
+        source: "BEACHHEAD_EXECUTOR",
+        pair: request.pair,
+        buyExchange: request.buyExchange,
+        sellExchange: request.sellExchange,
+        buyPrice: executionData.buyPrice ?? request.buyPrice,
+        sellPrice: executionData.sellPrice ?? request.sellPrice,
+        amount: request.amount,
+        realizedPnl: executionData.realizedPnl ?? 0,
+        grossSpreadBps: request.grossSpreadBps,
+        netSpreadBps: request.netSpreadBps ?? request.grossSpreadBps,
+        durationMs: executionData.durationMs ?? 0,
+        status: executionData.status,
+        timestamp: new Date().toISOString(),
+      }),
+    }).catch(() => {});
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown";
     console.error(`[BEACHHEAD] Execution error — id=${request.id} error=${msg}`);
